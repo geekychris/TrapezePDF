@@ -1,4 +1,4 @@
-# pdfview-os4 — User Guide
+# TrapezePDF — User Guide
 
 Current version: **pre-alpha** (2026-08). See `docs/ROADMAP.md` for
 what's done and what's not.

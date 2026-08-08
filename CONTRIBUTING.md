@@ -1,4 +1,4 @@
-# Contributing to pdfview-os4
+# Contributing to TrapezePDF
 
 ## Development environment
 
@@ -120,8 +120,8 @@ There's no automated test suite yet. Manual test protocol:
 Every new source file starts with:
 ```c
 /*
- * pdfview-os4 — a native PDF viewer for AmigaOS 4.
- * Copyright (C) 2026  pdfview-os4 contributors
+ * TrapezePDF — a native PDF viewer for AmigaOS 4.
+ * Copyright (C) 2026  TrapezePDF contributors
  *
  * Licensed under the GNU Affero General Public License v3 or later.
  * See LICENSE for full terms.

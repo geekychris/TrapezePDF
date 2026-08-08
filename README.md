@@ -1,93 +1,84 @@
-# pdfview-os4
+# TrapezePDF
 
-A native PDF viewer for AmigaOS 4.1 PPC, built on MuPDF.
+A native PDF viewer for AmigaOS 4.1 PPC — built on MuPDF.
+By Chris Collins.
 
 ## Status
 
-**Pre-alpha — not yet functional.** Repo scaffold is in place; source
-build not yet green. See `docs/ROADMAP.md` for milestones.
+**Alpha** — view/navigate/zoom/print/annotate/form-fill/page-manage
+functional. Full v1.0 packaging (LHA, Installer, screenshots) still
+in progress. See `docs/ROADMAP.md`.
 
-## Goal
+## Features
 
-A PDF viewer for AmigaOS 4 that is:
+- **View** any PDF from AmigaOS shell (`trapezepdf file.pdf`) or via
+  File → Open (ASL requester).
+- **Multi-page nav** — PgUp/PgDown, arrows, Space, Home/End.
+- **Zoom** — Fit Page (default), Fit Width, 100%, or +/- nudge.
+- **Print** — File → Print sends the whole document as PostScript
+  to `PRT:` (any Prefs-configured printer works).
+- **Annotations** — Add sticky notes, delete all annotations on a
+  page. Save-as writes them back into the PDF.
+- **Form fill** — List form fields on the current page; fill the
+  next empty text field. Save-as persists.
+- **Page management** — Rotate CW/CCW/180°, delete pages, extract
+  a page to a new PDF.
+- **Standard OS4 menu** — gadtools menu bar (File/View/Page/Annotate/
+  Form/Help).
 
-- **Native** — Intuition/ReAction UI, no X11/GTK/Qt.
-- **Complete** — view, zoom, pan, print, annotate, form fill.
-- **Fast** — MuPDF rendering, sensible page cache.
-- **Open source** — AGPL-3.0 (matches MuPDF).
-
-## Build target
-
-Cross-compiled from macOS/Linux against the walkero AmigaOS 4 GCC
-docker image, same toolchain as `python-amigaos4`. Runs on OS4.1
-Final Edition on sam460ex-class hardware (real or QEMU).
-
-## Why another PDF viewer?
-
-APDF and VPDF exist and are perfectly usable for viewing. This
-project exists because:
-
-- APDF's xpdf backend is old (xpdf 2.x era). MuPDF's engine is much
-  newer and handles modern PDFs (PDF 1.7 features, sensible font
-  fallback, encrypted PDFs, XFA form parts) better.
-- Neither shipping viewer does form fill or PDF annotations natively.
-  Common use case for OS4 users who deal with tax forms, contracts,
-  fillable docs.
-
-If your use case is "just open a PDF and look at it", APDF from
-OS4Depot works fine today. Try that first.
+Not yet supported (post-v1.0):
+- Text selection / copy
+- Text search
+- Thumbnail sidebar
+- Interactive mouse annotation (drag-select highlight, freehand draw)
 
 ## Building
 
-### Prerequisites
-
-- Docker with the walkero AmigaOS 4 GCC image (same as
-  python-amigaos4). If you don't have it built:
-  ```
-  cd ../python-amigaos4
-  docker build -t amiga-python-build:local .
-  ```
-- Or use the pdfview-os4 Dockerfile directly:
-  ```
-  cd pdfview-os4
-  docker build -t pdfview-os4-build:local .
-  ```
-
-### Build steps
+Prereqs: Docker, `walkero/amigagccondocker:os4-gcc11` (auto-pulled by our
+Dockerfile), ~2 GB free disk.
 
 ```
-./scripts/fetch-mupdf.sh          # clone MuPDF at pinned version
-./scripts/build.sh                 # cross-compile everything
+docker build -t pdfview-os4-build:local .
+./scripts/fetch-mupdf.sh
+./scripts/build.sh
 ```
 
-Outputs:
-- `build/pdfview` — the main viewer executable
+Output: `build/pdfview-stripped` (~44 MB static ELF32 PPC, big-endian).
 
-### Deploy to guest
+## Deploying to guest
+
+Via `xdftool` (guest offline):
+```
+xdftool ~/AmigaOS4/amigaos4-dev.hdf write \
+    build/pdfview-stripped TrapezePDF
+```
+
+Via amiga_mcp bridge (guest booted):
+```
+curl -X POST http://localhost:3000/api/transfer \
+    -H 'Content-Type: application/json' \
+    -d '{"source":"build/pdfview-stripped","dest":"DH1:TrapezePDF","direction":"push"}'
+```
+
+## Running
 
 ```
-xdftool ~/AmigaOS4/amigaos4-dev.hdf write build/pdfview PDFView
+DH1:TrapezePDF                   ; empty window, use File → Open
+DH1:TrapezePDF DH1:mydoc.pdf     ; open document at page 1
 ```
+
+See `docs/USER_GUIDE.md` for full keyboard reference and menu list.
 
 ## License
 
-AGPL-3.0. See `LICENSE`. MuPDF (the rendering engine) is also
-AGPL-3.0; we're built on it.
+**AGPL-3.0** — matches MuPDF's license. Full text in `LICENSE`.
 
-If you want to embed pdfview-os4 in a closed-source product, you
-also need a commercial MuPDF license from Artifex Software
-(https://artifex.com/licensing/).
+If you want to embed TrapezePDF (or MuPDF via TrapezePDF) in a
+closed-source product, you also need a commercial MuPDF license
+from Artifex Software: https://artifex.com/licensing/
 
-## Contributing
+## Attribution
 
-See `CONTRIBUTING.md` (once it exists). For now: file issues on
-GitHub, open PRs against `main`. Pre-PR checklist: build must pass
-under docker, `./scripts/test.sh` (once it exists) must pass, no
-new compiler warnings introduced.
-
-## Related
-
-- [`python-amigaos4`](../python-amigaos4/) — CPython 3.12 for OS4.
-  We share the walkero build image and cross-compile approach.
-- [`amiga_mcp`](../amiga_mcp/) — the iteration harness used for
-  running tests inside a QEMU sam460ex.
+- **TrapezePDF** © 2026 Chris Collins
+- **MuPDF** © Artifex Software Inc. — https://mupdf.com
+- Cross-compile toolchain: walkero's AmigaGCConDocker

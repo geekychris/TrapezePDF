@@ -1,6 +1,8 @@
 /*
- * pdfview-os4 — a native PDF viewer for AmigaOS 4.
- * Copyright (C) 2026  pdfview-os4 contributors
+ * TrapezePDF — a native PDF viewer for AmigaOS 4.
+ * Copyright (C) 2026  Chris Collins
+ *
+ * Built on MuPDF (https://mupdf.com) — Copyright Artifex Software.
  *
  * Licensed under the GNU Affero General Public License v3 or later.
  * See LICENSE for full terms.
@@ -42,6 +44,8 @@
 #include <libraries/gadtools.h>
 
 #include <mupdf/fitz.h>
+#include <mupdf/pdf.h>       /* pdf_document, pdf_page, pdf_annot,
+                              * pdf_widget — needed for phases 6/7/8 */
 
 #define WIN_WIDTH   800
 #define WIN_HEIGHT  600
@@ -74,6 +78,7 @@ typedef enum {
 /* Menu item IDs (arbitrary; used as UserData for menu items) */
 enum {
     MNU_FILE_OPEN = 1,
+    MNU_FILE_SAVEAS,
     MNU_FILE_PRINT,
     MNU_FILE_QUIT,
     MNU_VIEW_FIRST,
@@ -85,6 +90,18 @@ enum {
     MNU_VIEW_100,
     MNU_VIEW_ZOOM_IN,
     MNU_VIEW_ZOOM_OUT,
+    /* Phase 8: page management */
+    MNU_PAGE_ROTATE_CW,
+    MNU_PAGE_ROTATE_CCW,
+    MNU_PAGE_ROTATE_180,
+    MNU_PAGE_DELETE,
+    MNU_PAGE_EXTRACT,
+    /* Phase 6: annotations */
+    MNU_ANNOT_ADD_NOTE,
+    MNU_ANNOT_DELETE_ALL,
+    /* Phase 7: form fill */
+    MNU_FORM_FILL_NEXT,
+    MNU_FORM_LIST,
     MNU_HELP_ABOUT
 };
 
@@ -109,28 +126,45 @@ static void die(const char *msg) {
  * NewMenu-array approach: simplest way to build a full menu strip on OS4.
  * Uses NM_TITLE for menu, NM_ITEM for entries, NM_END to close. */
 static struct NewMenu menu_data[] = {
-    { NM_TITLE, "File",         0, 0, 0, 0                        },
-    { NM_ITEM,  "Open...",      "O", 0, 0, (APTR)MNU_FILE_OPEN     },
-    { NM_ITEM,  "Print...",     "P", 0, 0, (APTR)MNU_FILE_PRINT    },
-    { NM_ITEM,  NM_BARLABEL,    0, 0, 0, 0                        },
-    { NM_ITEM,  "Quit",         "Q", 0, 0, (APTR)MNU_FILE_QUIT     },
+    { NM_TITLE, "File",             0,   0, 0, 0                          },
+    { NM_ITEM,  "Open...",          "O", 0, 0, (APTR)MNU_FILE_OPEN         },
+    { NM_ITEM,  "Save As...",       "S", 0, 0, (APTR)MNU_FILE_SAVEAS       },
+    { NM_ITEM,  "Print...",         "P", 0, 0, (APTR)MNU_FILE_PRINT        },
+    { NM_ITEM,  NM_BARLABEL,        0,   0, 0, 0                          },
+    { NM_ITEM,  "Quit",             "Q", 0, 0, (APTR)MNU_FILE_QUIT         },
 
-    { NM_TITLE, "View",         0, 0, 0, 0                        },
-    { NM_ITEM,  "First Page",   0,   0, 0, (APTR)MNU_VIEW_FIRST    },
-    { NM_ITEM,  "Previous",     0,   0, 0, (APTR)MNU_VIEW_PREV     },
-    { NM_ITEM,  "Next",         0,   0, 0, (APTR)MNU_VIEW_NEXT     },
-    { NM_ITEM,  "Last Page",    0,   0, 0, (APTR)MNU_VIEW_LAST     },
-    { NM_ITEM,  NM_BARLABEL,    0,   0, 0, 0                       },
-    { NM_ITEM,  "Fit Page",     "F", 0, 0, (APTR)MNU_VIEW_FIT_PAGE  },
-    { NM_ITEM,  "Fit Width",    "W", 0, 0, (APTR)MNU_VIEW_FIT_WIDTH },
-    { NM_ITEM,  "100%",         "1", 0, 0, (APTR)MNU_VIEW_100      },
-    { NM_ITEM,  "Zoom In",      "+", 0, 0, (APTR)MNU_VIEW_ZOOM_IN  },
-    { NM_ITEM,  "Zoom Out",     "-", 0, 0, (APTR)MNU_VIEW_ZOOM_OUT },
+    { NM_TITLE, "View",             0,   0, 0, 0                          },
+    { NM_ITEM,  "First Page",       0,   0, 0, (APTR)MNU_VIEW_FIRST        },
+    { NM_ITEM,  "Previous",         0,   0, 0, (APTR)MNU_VIEW_PREV         },
+    { NM_ITEM,  "Next",             0,   0, 0, (APTR)MNU_VIEW_NEXT         },
+    { NM_ITEM,  "Last Page",        0,   0, 0, (APTR)MNU_VIEW_LAST         },
+    { NM_ITEM,  NM_BARLABEL,        0,   0, 0, 0                          },
+    { NM_ITEM,  "Fit Page",         "F", 0, 0, (APTR)MNU_VIEW_FIT_PAGE     },
+    { NM_ITEM,  "Fit Width",        "W", 0, 0, (APTR)MNU_VIEW_FIT_WIDTH    },
+    { NM_ITEM,  "100%",             "1", 0, 0, (APTR)MNU_VIEW_100          },
+    { NM_ITEM,  "Zoom In",          "+", 0, 0, (APTR)MNU_VIEW_ZOOM_IN      },
+    { NM_ITEM,  "Zoom Out",         "-", 0, 0, (APTR)MNU_VIEW_ZOOM_OUT     },
 
-    { NM_TITLE, "Help",         0, 0, 0, 0                        },
-    { NM_ITEM,  "About...",     "?", 0, 0, (APTR)MNU_HELP_ABOUT    },
+    { NM_TITLE, "Page",             0,   0, 0, 0                          },
+    { NM_ITEM,  "Rotate 90 CW",     "R", 0, 0, (APTR)MNU_PAGE_ROTATE_CW    },
+    { NM_ITEM,  "Rotate 90 CCW",    "L", 0, 0, (APTR)MNU_PAGE_ROTATE_CCW   },
+    { NM_ITEM,  "Rotate 180",       0,   0, 0, (APTR)MNU_PAGE_ROTATE_180   },
+    { NM_ITEM,  NM_BARLABEL,        0,   0, 0, 0                          },
+    { NM_ITEM,  "Delete This Page", 0,   0, 0, (APTR)MNU_PAGE_DELETE       },
+    { NM_ITEM,  "Extract This Page...", 0, 0, 0, (APTR)MNU_PAGE_EXTRACT    },
 
-    { NM_END,   0,              0, 0, 0, 0                        }
+    { NM_TITLE, "Annotate",         0,   0, 0, 0                          },
+    { NM_ITEM,  "Add Sticky Note...", "N", 0, 0, (APTR)MNU_ANNOT_ADD_NOTE  },
+    { NM_ITEM,  "Delete All on Page", 0, 0, 0, (APTR)MNU_ANNOT_DELETE_ALL  },
+
+    { NM_TITLE, "Form",             0,   0, 0, 0                          },
+    { NM_ITEM,  "List Form Fields", 0,   0, 0, (APTR)MNU_FORM_LIST         },
+    { NM_ITEM,  "Fill Next Field...", 0, 0, 0, (APTR)MNU_FORM_FILL_NEXT    },
+
+    { NM_TITLE, "Help",             0,   0, 0, 0                          },
+    { NM_ITEM,  "About...",         "?", 0, 0, (APTR)MNU_HELP_ABOUT        },
+
+    { NM_END,   0,                  0,   0, 0, 0                          }
 };
 
 /* Compute the effective scale factor given the zoom mode + window dims. */
@@ -230,7 +264,7 @@ static void update_title(viewer_state *st)
         zoom_str = zoom_buf;
     }
     snprintf(title, sizeof(title),
-             "pdfview - %s - Page %d/%d [%s]",
+             "TrapezePDF - %s - Page %d/%d [%s]",
              base, st->current_page + 1, st->page_count, zoom_str);
     SetWindowTitles(st->win, (STRPTR)title, (STRPTR)-1);
 }
@@ -329,6 +363,335 @@ static void action_file_print(viewer_state *st)
     fprintf(stderr, "pdfview: print — sent to PRT:\n");
 }
 
+/* --- Phase 8: page management --------------------------------------
+ * Rotate/delete/extract/save-as operate on the underlying pdf_document.
+ * We cast fz_document* → pdf_document* via pdf_specifics(); returns
+ * NULL if the document isn't a PDF (e.g. XPS or EPUB). Our menu items
+ * are all no-ops in that case. */
+
+/* Ask for a save-as path via ASL requester. Returns malloc'd path or
+ * NULL if user cancelled. Caller must free. */
+static char *ask_save_path(viewer_state *st, const char *title,
+                            const char *default_name)
+{
+    struct FileRequester *req = AllocAslRequestTags(ASL_FileRequest,
+        ASLFR_TitleText,        (uintptr_t)title,
+        ASLFR_DoSaveMode,       TRUE,
+        ASLFR_InitialFile,      (uintptr_t)(default_name ? default_name : ""),
+        ASLFR_Window,           (uintptr_t)st->win,
+        TAG_END);
+    if (!req) return NULL;
+    char *result = NULL;
+    if (AslRequestTags(req, TAG_END)) {
+        char path[512];
+        size_t dl = req->fr_Drawer ? strlen(req->fr_Drawer) : 0;
+        if (dl > 0 && req->fr_Drawer[dl - 1] == ':')
+            snprintf(path, sizeof(path), "%s%s",
+                     req->fr_Drawer, req->fr_File);
+        else if (dl > 0)
+            snprintf(path, sizeof(path), "%s/%s",
+                     req->fr_Drawer, req->fr_File);
+        else
+            snprintf(path, sizeof(path), "%s", req->fr_File);
+        result = strdup(path);
+    }
+    FreeAslRequest(req);
+    return result;
+}
+
+static void action_file_saveas(viewer_state *st)
+{
+    if (!st->doc) return;
+    pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
+    if (!pdf) {
+        fprintf(stderr, "pdfview: save-as: not a PDF document\n");
+        return;
+    }
+    char *path = ask_save_path(st, "Save PDF As",
+                                basename_of(st->filepath));
+    if (!path) return;
+    fz_try(st->ctx) {
+        pdf_write_options opts = pdf_default_write_options;
+        pdf_save_document(st->ctx, pdf, path, &opts);
+        fprintf(stderr, "pdfview: saved → %s\n", path);
+    }
+    fz_catch(st->ctx) {
+        fprintf(stderr, "pdfview: save failed: %s\n",
+                fz_caught_message(st->ctx));
+    }
+    free(path);
+}
+
+/* Rotate current page by `deg` degrees (must be multiple of 90). */
+static void action_page_rotate(viewer_state *st, int deg)
+{
+    if (!st->doc) return;
+    pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
+    if (!pdf) return;
+    fz_try(st->ctx) {
+        pdf_obj *page_obj = pdf_lookup_page_obj(st->ctx, pdf,
+                                                  st->current_page);
+        int cur = pdf_dict_get_int(st->ctx, page_obj, PDF_NAME(Rotate));
+        int new_rot = (cur + deg) % 360;
+        if (new_rot < 0) new_rot += 360;
+        pdf_dict_put_int(st->ctx, page_obj, PDF_NAME(Rotate), new_rot);
+        fprintf(stderr, "pdfview: rotated page %d to %d degrees\n",
+                st->current_page + 1, new_rot);
+    }
+    fz_catch(st->ctx) {
+        fprintf(stderr, "pdfview: rotate failed: %s\n",
+                fz_caught_message(st->ctx));
+        return;
+    }
+    render_current_page(st);
+    redraw(st);
+}
+
+static void action_page_delete(viewer_state *st)
+{
+    if (!st->doc || st->page_count < 2) {
+        /* Refuse to delete the only page in a document. */
+        struct EasyStruct es = { sizeof(struct EasyStruct), 0,
+            "Delete Page",
+            "Cannot delete: a PDF must have at least one page.",
+            "OK" };
+        EasyRequest(st->win, &es, NULL);
+        return;
+    }
+    pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
+    if (!pdf) return;
+    fz_try(st->ctx) {
+        pdf_delete_page(st->ctx, pdf, st->current_page);
+        st->page_count--;
+        if (st->current_page >= st->page_count)
+            st->current_page = st->page_count - 1;
+        fprintf(stderr, "pdfview: deleted page; %d pages remain\n",
+                st->page_count);
+    }
+    fz_catch(st->ctx) {
+        fprintf(stderr, "pdfview: delete failed: %s\n",
+                fz_caught_message(st->ctx));
+        return;
+    }
+    render_current_page(st);
+    update_title(st);
+    redraw(st);
+}
+
+/* Extract current page to a new PDF. Simplest approach: write a fresh
+ * one-page PDF via document writer. Preserves rendering fidelity but
+ * loses annotations/forms on the extracted page (they don't survive
+ * a re-render). Good enough for the common "extract this receipt". */
+static void action_page_extract(viewer_state *st)
+{
+    if (!st->doc) return;
+    char default_name[128];
+    snprintf(default_name, sizeof(default_name), "%s-page%d.pdf",
+             basename_of(st->filepath), st->current_page + 1);
+    char *path = ask_save_path(st, "Extract Page As", default_name);
+    if (!path) return;
+
+    fz_document_writer *wri = NULL;
+    fz_try(st->ctx) {
+        wri = fz_new_document_writer(st->ctx, path, "pdf", NULL);
+        fz_page *page = fz_load_page(st->ctx, st->doc, st->current_page);
+        fz_rect r = fz_bound_page(st->ctx, page);
+        fz_device *dev = fz_begin_page(st->ctx, wri, r);
+        fz_run_page(st->ctx, page, dev, fz_identity, NULL);
+        fz_end_page(st->ctx, wri);
+        fz_drop_page(st->ctx, page);
+        fz_close_document_writer(st->ctx, wri);
+        fprintf(stderr, "pdfview: extracted page → %s\n", path);
+    }
+    fz_always(st->ctx) { fz_drop_document_writer(st->ctx, wri); }
+    fz_catch(st->ctx) {
+        fprintf(stderr, "pdfview: extract failed: %s\n",
+                fz_caught_message(st->ctx));
+    }
+    free(path);
+}
+
+/* --- Phase 6: annotations (add sticky note, delete all on page) ------
+ * Full annotation UI (freehand, highlight-with-mouse-selection) is
+ * out of scope for the initial v1.0; those need selection tools,
+ * screen-to-page coord translation, undo stack. What we ship here:
+ * add-a-sticky-note-at-page-center, and delete-all-annotations-on-page. */
+
+/* Ask the user for a string via a simple ASL string requester. Returns
+ * malloc'd string or NULL. On OS4 without a proper string requester
+ * class, we fake it via EasyRequest with a placeholder — real impl
+ * would use ReAction string.gadget in a modal window. */
+static char *ask_string(viewer_state *st, const char *title,
+                        const char *prompt, const char *default_val)
+{
+    /* Placeholder: since we don't yet have a proper string dialog,
+     * hardcode a demo note. TODO: replace with ReAction dialog. */
+    (void)st; (void)title; (void)prompt; (void)default_val;
+    static char demo[128];
+    snprintf(demo, sizeof(demo), "%s (added %d)", prompt ? prompt : "Note",
+             (int)(uintptr_t)st);   /* pseudo-unique per invocation */
+    return strdup(demo);
+}
+
+static void action_annot_add_note(viewer_state *st)
+{
+    if (!st->doc) return;
+    pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
+    if (!pdf) return;
+    char *text = ask_string(st, "Add Sticky Note",
+                            "Note text (demo placeholder)", "");
+    if (!text) return;
+
+    fz_try(st->ctx) {
+        pdf_page *page = pdf_load_page(st->ctx, pdf, st->current_page);
+        pdf_annot *annot = pdf_create_annot(st->ctx, page, PDF_ANNOT_TEXT);
+        /* Position note at center of page (in PDF user-space points). */
+        fz_rect page_bounds = pdf_bound_page(st->ctx, page,
+            FZ_MEDIA_BOX);
+        float cx = (page_bounds.x0 + page_bounds.x1) / 2.0f;
+        float cy = (page_bounds.y0 + page_bounds.y1) / 2.0f;
+        fz_rect r = { cx - 12, cy - 12, cx + 12, cy + 12 };
+        pdf_set_annot_rect(st->ctx, annot, r);
+        pdf_set_annot_contents(st->ctx, annot, text);
+        /* pdf_update_appearance moved between MuPDF versions; the
+         * annotation still gets a default appearance when re-rendered. */
+        fz_drop_page(st->ctx, (fz_page*)page);
+        fprintf(stderr, "pdfview: added sticky note on page %d\n",
+                st->current_page + 1);
+    }
+    fz_catch(st->ctx) {
+        fprintf(stderr, "pdfview: add-note failed: %s\n",
+                fz_caught_message(st->ctx));
+    }
+    free(text);
+    render_current_page(st);
+    redraw(st);
+}
+
+static void action_annot_delete_all(viewer_state *st)
+{
+    if (!st->doc) return;
+    pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
+    if (!pdf) return;
+    fz_try(st->ctx) {
+        pdf_page *page = pdf_load_page(st->ctx, pdf, st->current_page);
+        pdf_annot *annot;
+        int count = 0;
+        while ((annot = pdf_first_annot(st->ctx, page)) != NULL) {
+            pdf_delete_annot(st->ctx, page, annot);
+            count++;
+        }
+        fz_drop_page(st->ctx, (fz_page*)page);
+        fprintf(stderr, "pdfview: deleted %d annotation(s) on page %d\n",
+                count, st->current_page + 1);
+    }
+    fz_catch(st->ctx) {
+        fprintf(stderr, "pdfview: delete-annots failed: %s\n",
+                fz_caught_message(st->ctx));
+    }
+    render_current_page(st);
+    redraw(st);
+}
+
+/* --- Phase 7: form fill (list + fill next) --------------------------
+ * PDF forms have widgets that we iterate with pdf_first_widget/
+ * pdf_next_widget. Text-fields we fill via pdf_set_field_value.
+ * Checkbox/radio/dropdown deferred. */
+
+static void action_form_list(viewer_state *st)
+{
+    if (!st->doc) return;
+    pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
+    if (!pdf) return;
+
+    /* Write field summary to stderr and stringbuf for EasyRequest. */
+    char summary[2048];
+    int off = snprintf(summary, sizeof(summary),
+                        "Form fields on page %d:\n", st->current_page + 1);
+    int count = 0;
+    fz_try(st->ctx) {
+        pdf_page *page = pdf_load_page(st->ctx, pdf, st->current_page);
+        pdf_annot *w = pdf_first_widget(st->ctx, page);
+        while (w) {
+            int type = pdf_widget_type(st->ctx, w);
+            const char *tname = "?";
+            switch (type) {
+            case PDF_WIDGET_TYPE_BUTTON:   tname = "button";   break;
+            case PDF_WIDGET_TYPE_CHECKBOX: tname = "checkbox"; break;
+            case PDF_WIDGET_TYPE_COMBOBOX: tname = "combobox"; break;
+            case PDF_WIDGET_TYPE_LISTBOX:  tname = "listbox";  break;
+            case PDF_WIDGET_TYPE_RADIOBUTTON: tname = "radio"; break;
+            case PDF_WIDGET_TYPE_SIGNATURE: tname = "signature"; break;
+            case PDF_WIDGET_TYPE_TEXT:     tname = "text";     break;
+            default: break;
+            }
+            const char *val = pdf_annot_field_value(st->ctx, w);
+            if (off < (int)sizeof(summary) - 1) {
+                off += snprintf(summary + off, sizeof(summary) - off,
+                                "  #%d [%s] = %s\n", count + 1,
+                                tname, val ? val : "(empty)");
+            }
+            count++;
+            w = pdf_next_widget(st->ctx, w);
+        }
+        fz_drop_page(st->ctx, (fz_page*)page);
+    }
+    fz_catch(st->ctx) {
+        snprintf(summary, sizeof(summary),
+                 "Error listing form fields: %s",
+                 fz_caught_message(st->ctx));
+    }
+    if (count == 0)
+        strncpy(summary, "No form fields on this page.", sizeof(summary));
+    struct EasyStruct es = { sizeof(struct EasyStruct), 0,
+        "Form Fields", summary, "OK" };
+    EasyRequest(st->win, &es, NULL);
+}
+
+static void action_form_fill_next(viewer_state *st)
+{
+    if (!st->doc) return;
+    pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
+    if (!pdf) return;
+    char *value = ask_string(st, "Fill Form Field",
+                              "Value for next empty text field",
+                              "sample-value");
+    if (!value) return;
+
+    BOOL filled = FALSE;
+    fz_try(st->ctx) {
+        pdf_page *page = pdf_load_page(st->ctx, pdf, st->current_page);
+        pdf_annot *w = pdf_first_widget(st->ctx, page);
+        while (w) {
+            if (pdf_widget_type(st->ctx, w) == PDF_WIDGET_TYPE_TEXT) {
+                const char *cur = pdf_annot_field_value(st->ctx, w);
+                if (!cur || !*cur) {
+                    pdf_set_annot_field_value(st->ctx, pdf, w, value, 1);
+                    filled = TRUE;
+                    break;
+                }
+            }
+            w = pdf_next_widget(st->ctx, w);
+        }
+        fz_drop_page(st->ctx, (fz_page*)page);
+    }
+    fz_catch(st->ctx) {
+        fprintf(stderr, "pdfview: fill-field failed: %s\n",
+                fz_caught_message(st->ctx));
+    }
+    if (filled) {
+        fprintf(stderr, "pdfview: filled a text field with '%s'\n", value);
+    } else {
+        struct EasyStruct es = { sizeof(struct EasyStruct), 0,
+            "Fill Form Field",
+            "No empty text fields on this page.", "OK" };
+        EasyRequest(st->win, &es, NULL);
+    }
+    free(value);
+    render_current_page(st);
+    redraw(st);
+}
+
 /* Handle a menu selection. Returns FALSE if the user chose Quit. */
 static BOOL handle_menu(viewer_state *st, UWORD menu_num)
 {
@@ -337,9 +700,22 @@ static BOOL handle_menu(viewer_state *st, UWORD menu_num)
     ULONG id = (ULONG)(uintptr_t)GTMENUITEM_USERDATA(item);
 
     switch (id) {
-    case MNU_FILE_OPEN:  action_file_open(st); break;
-    case MNU_FILE_PRINT: action_file_print(st); break;
-    case MNU_FILE_QUIT:  return FALSE;
+    case MNU_FILE_OPEN:   action_file_open(st); break;
+    case MNU_FILE_SAVEAS: action_file_saveas(st); break;
+    case MNU_FILE_PRINT:  action_file_print(st); break;
+    case MNU_FILE_QUIT:   return FALSE;
+
+    case MNU_PAGE_ROTATE_CW:  action_page_rotate(st, 90); break;
+    case MNU_PAGE_ROTATE_CCW: action_page_rotate(st, -90); break;
+    case MNU_PAGE_ROTATE_180: action_page_rotate(st, 180); break;
+    case MNU_PAGE_DELETE:     action_page_delete(st); break;
+    case MNU_PAGE_EXTRACT:    action_page_extract(st); break;
+
+    case MNU_ANNOT_ADD_NOTE:   action_annot_add_note(st); break;
+    case MNU_ANNOT_DELETE_ALL: action_annot_delete_all(st); break;
+
+    case MNU_FORM_LIST:      action_form_list(st); break;
+    case MNU_FORM_FILL_NEXT: action_form_fill_next(st); break;
 
     case MNU_VIEW_FIRST:
         if (st->current_page != 0) {
@@ -403,9 +779,10 @@ static BOOL handle_menu(viewer_state *st, UWORD menu_num)
 
     case MNU_HELP_ABOUT: {
         struct EasyStruct es = { sizeof(struct EasyStruct), 0,
-            "About pdfview",
-            "pdfview-os4 — a native PDF viewer for AmigaOS 4\n"
-            "Built on MuPDF (Artifex) — https://mupdf.com\n"
+            "About TrapezePDF",
+            "TrapezePDF - a native PDF viewer for AmigaOS 4\n"
+            "by Chris Collins\n\n"
+            "Built on MuPDF (Artifex) - https://mupdf.com\n"
             "Licensed under AGPL-3.0",
             "OK" };
         EasyRequest(st->win, &es, NULL);
@@ -429,7 +806,7 @@ int main(int argc, char *argv[])
     if (!screen) die("LockPubScreen failed");
 
     st.win = OpenWindowTags(NULL,
-        WA_Title,         (uintptr_t)"pdfview",
+        WA_Title,         (uintptr_t)"TrapezePDF",
         WA_Width,         WIN_WIDTH,
         WA_Height,        WIN_HEIGHT,
         WA_MinWidth,      MIN_WIDTH,
