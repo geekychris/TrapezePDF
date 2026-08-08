@@ -18,12 +18,12 @@
  *
  * ---------------------------------------------------------------
  *
- * Phase 1 MVP: opens the PDF given on the command line, renders
- * page 1 at 100% into a fixed 800x600 Intuition window. Any key or
- * close-gadget exits. This proves the mupdf-→-Intuition rendering
- * pipeline works before we build the ReAction UI on top.
+ * Phase 1+2 with basic fit-to-window scaling. Opens the PDF given on
+ * the command line, renders each page fit-to-window into an Intuition
+ * window, supports PgUp/PgDown/Home/End navigation, ESC or close-gadget
+ * to exit. Window resize also re-renders.
  *
- * Argument: full path to a .pdf file (no ASL requester yet).
+ * Argument: full path to a .pdf file.
  * Example:  pdfview  DH1:mydoc.pdf
  */
 
@@ -38,18 +38,131 @@
 #include <intuition/intuition.h>
 #include <graphics/gfx.h>
 #include <graphics/rastport.h>
+#include <devices/inputevent.h>
 
 #include <mupdf/fitz.h>
 
-/* Fixed window size for Phase 1 — big enough to see something, small
- * enough to fit any reasonable OS4 screen. Later phases will resize
- * to fit page dimensions or open on a chosen screen mode. */
+/* Initial window dimensions. Later phases add screen-size detection
+ * and remember last window bounds via ENV: file. */
 #define WIN_WIDTH   800
 #define WIN_HEIGHT  600
+#define MIN_WIDTH   400
+#define MIN_HEIGHT  300
+
+/* --- Raw key codes for OS4 (from intuition/RAWKEY constants) --- */
+#define RAWKEY_ESCAPE      0x45
+#define RAWKEY_UP          0x4C
+#define RAWKEY_DOWN        0x4D
+#define RAWKEY_LEFT        0x4F
+#define RAWKEY_RIGHT       0x4E
+#define RAWKEY_PAGEUP      0x48   /* shift-up */
+#define RAWKEY_PAGEDOWN    0x49   /* shift-down */
+#define RAWKEY_HOME        0x70
+#define RAWKEY_END         0x71
+#define RAWKEY_SPACE       0x40   /* also advances page */
+#define RAWKEY_BACKSPACE   0x41   /* also goes back */
+
+/* --- Global viewer state (kept small; not thread-shared) --- */
+typedef struct {
+    fz_context *ctx;
+    fz_document *doc;
+    int page_count;
+    int current_page;      /* 0-based */
+    struct Window *win;
+    fz_pixmap *pix;        /* current rendered page; NULL until first render */
+} viewer_state;
 
 static void die(const char *msg) {
     fprintf(stderr, "pdfview: %s\n", msg);
     exit(1);
+}
+
+/* Render current_page fit-to-window into a fresh pixmap. Drops any
+ * previous pixmap first. On error leaves state->pix as NULL. */
+static void render_current_page(viewer_state *st) {
+    if (st->pix) {
+        fz_drop_pixmap(st->ctx, st->pix);
+        st->pix = NULL;
+    }
+    if (!st->doc) return;
+
+    fz_page *page = NULL;
+    fz_try(st->ctx) {
+        page = fz_load_page(st->ctx, st->doc, st->current_page);
+        fz_rect bounds = fz_bound_page(st->ctx, page);
+        float pw = bounds.x1 - bounds.x0;
+        float ph = bounds.y1 - bounds.y0;
+
+        /* Client area inside window borders. */
+        int win_w = st->win->Width  - st->win->BorderLeft - st->win->BorderRight;
+        int win_h = st->win->Height - st->win->BorderTop  - st->win->BorderBottom;
+        if (win_w < 1) win_w = 1;
+        if (win_h < 1) win_h = 1;
+
+        /* Fit-page: scale so entire page fits inside client area. */
+        float sx = win_w / pw;
+        float sy = win_h / ph;
+        float scale = sx < sy ? sx : sy;
+
+        fz_matrix ctm = fz_scale(scale, scale);
+        st->pix = fz_new_pixmap_from_page(st->ctx, page, ctm,
+                                           fz_device_rgb(st->ctx), 0);
+    }
+    fz_always(st->ctx) {
+        fz_drop_page(st->ctx, page);
+    }
+    fz_catch(st->ctx) {
+        fprintf(stderr, "pdfview: render page %d failed: %s\n",
+                st->current_page + 1, fz_caught_message(st->ctx));
+    }
+}
+
+/* Blit current pixmap into window client area, centered if smaller
+ * than the client rectangle. Clears background first (gray) so
+ * previous pixels don't ghost through when a page is smaller. */
+static void redraw(viewer_state *st) {
+    struct Window *w = st->win;
+    int cx = w->BorderLeft;
+    int cy = w->BorderTop;
+    int cw = w->Width  - w->BorderLeft - w->BorderRight;
+    int ch = w->Height - w->BorderTop  - w->BorderBottom;
+
+    /* Clear client area to a middle gray so partial-page draws don't
+     * ghost previous content. */
+    SetAPen(w->RPort, 0);
+    RectFill(w->RPort, cx, cy, cx + cw - 1, cy + ch - 1);
+
+    if (!st->pix) return;
+
+    int px = st->pix->w, py = st->pix->h;
+    /* Center pixmap in client area if smaller. */
+    int dx = cx + (cw - px) / 2;
+    int dy = cy + (ch - py) / 2;
+    if (dx < cx) dx = cx;
+    if (dy < cy) dy = cy;
+
+    int copy_w = px < cw ? px : cw;
+    int copy_h = py < ch ? py : ch;
+
+    WritePixelArray(st->pix->samples,
+                    0, 0, st->pix->stride,
+                    PIXF_R8G8B8,
+                    w->RPort,
+                    dx, dy,
+                    copy_w, copy_h);
+}
+
+/* Update window title with "pdfview — <filename> — Page X of Y". */
+static void update_title(viewer_state *st, const char *filename) {
+    static char title[256];
+    /* Take basename of filename for the title so long paths don't
+     * overflow the title bar. */
+    const char *base = strrchr(filename, '/');
+    if (!base) base = strrchr(filename, ':');
+    if (base) base++; else base = filename;
+    snprintf(title, sizeof(title), "pdfview - %s - Page %d of %d",
+             base, st->current_page + 1, st->page_count);
+    SetWindowTitles(st->win, (STRPTR)title, (STRPTR)-1);
 }
 
 int main(int argc, char *argv[]) {
@@ -59,98 +172,127 @@ int main(int argc, char *argv[]) {
     }
     const char *filename = argv[1];
 
-    /* --- MuPDF: init context, open document, load page 1 --- */
-    fz_context *ctx = fz_new_context(NULL, NULL, FZ_STORE_UNLIMITED);
-    if (!ctx) die("failed to init mupdf context");
-    fz_register_document_handlers(ctx);
+    viewer_state st = {0};
+    st.ctx = fz_new_context(NULL, NULL, FZ_STORE_UNLIMITED);
+    if (!st.ctx) die("failed to init mupdf context");
+    fz_register_document_handlers(st.ctx);
 
-    fz_document *doc = NULL;
-    fz_page *page = NULL;
-    fz_pixmap *pix = NULL;
-
-    fz_try(ctx) {
-        doc = fz_open_document(ctx, filename);
-        if (!doc) fz_throw(ctx, FZ_ERROR_GENERIC, "open_document returned NULL");
-        int page_count = fz_count_pages(ctx, doc);
-        fprintf(stderr, "pdfview: %s — %d pages\n", filename, page_count);
-
-        page = fz_load_page(ctx, doc, 0);  /* page 1 */
-        fz_rect bounds = fz_bound_page(ctx, page);
-        fprintf(stderr, "pdfview: page 1 is %.1f x %.1f pt\n",
-                bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
-
-        /* Render at 100% into an RGB pixmap. fz_scale(1,1) = 1:1;
-         * later we'll compute a fit-page zoom from the window size
-         * vs page dimensions. */
-        fz_matrix ctm = fz_scale(1.0f, 1.0f);
-        pix = fz_new_pixmap_from_page(ctx, page, ctm, fz_device_rgb(ctx), 0);
-        fprintf(stderr, "pdfview: rendered pixmap %dx%d, %d bytes\n",
-                pix->w, pix->h, pix->stride * pix->h);
+    fz_try(st.ctx) {
+        st.doc = fz_open_document(st.ctx, filename);
+        if (!st.doc) fz_throw(st.ctx, FZ_ERROR_GENERIC, "open_document NULL");
+        st.page_count = fz_count_pages(st.ctx, st.doc);
+        fprintf(stderr, "pdfview: %s — %d pages\n", filename, st.page_count);
     }
-    fz_catch(ctx) {
-        fprintf(stderr, "pdfview: mupdf error: %s\n", fz_caught_message(ctx));
-        fz_drop_pixmap(ctx, pix);
-        fz_drop_page(ctx, page);
-        fz_drop_document(ctx, doc);
-        fz_drop_context(ctx);
+    fz_catch(st.ctx) {
+        fprintf(stderr, "pdfview: cannot open %s: %s\n",
+                filename, fz_caught_message(st.ctx));
+        fz_drop_document(st.ctx, st.doc);
+        fz_drop_context(st.ctx);
         return 2;
     }
 
-    /* --- Open an Intuition window and blit the pixmap into it --- */
     struct Screen *screen = LockPubScreen(NULL);
     if (!screen) die("LockPubScreen failed");
 
-    struct Window *win = OpenWindowTags(NULL,
-        WA_Title,      (uintptr_t)"pdfview",
-        WA_Width,      WIN_WIDTH,
-        WA_Height,     WIN_HEIGHT,
-        WA_DragBar,    TRUE,
-        WA_DepthGadget,TRUE,
-        WA_CloseGadget,TRUE,
-        WA_SizeGadget, FALSE,
-        WA_Activate,   TRUE,
-        WA_PubScreen,  (uintptr_t)screen,
-        WA_IDCMP,      IDCMP_CLOSEWINDOW | IDCMP_RAWKEY,
+    st.win = OpenWindowTags(NULL,
+        WA_Title,         (uintptr_t)"pdfview",
+        WA_Width,         WIN_WIDTH,
+        WA_Height,        WIN_HEIGHT,
+        WA_MinWidth,      MIN_WIDTH,
+        WA_MinHeight,     MIN_HEIGHT,
+        WA_MaxWidth,      screen->Width,
+        WA_MaxHeight,     screen->Height,
+        WA_DragBar,       TRUE,
+        WA_DepthGadget,   TRUE,
+        WA_CloseGadget,   TRUE,
+        WA_SizeGadget,    TRUE,
+        WA_SizeBRight,    TRUE,
+        WA_SizeBBottom,   TRUE,
+        WA_Activate,      TRUE,
+        WA_PubScreen,     (uintptr_t)screen,
+        WA_IDCMP,         IDCMP_CLOSEWINDOW | IDCMP_RAWKEY |
+                          IDCMP_NEWSIZE | IDCMP_REFRESHWINDOW,
         TAG_END);
-    if (!win) { UnlockPubScreen(NULL, screen); die("OpenWindow failed"); }
+    if (!st.win) {
+        UnlockPubScreen(NULL, screen);
+        fz_drop_document(st.ctx, st.doc);
+        fz_drop_context(st.ctx);
+        die("OpenWindow failed");
+    }
 
-    /* MuPDF pixmap is packed RGB (3 bytes per pixel). OS4's
-     * WritePixelArray with PIXF_R8G8B8 matches that layout.
-     * Clip to window client area (page is likely larger than
-     * 800x600 at 100%). Draw at top-left of window client area. */
-    int src_w = pix->w, src_h = pix->h;
-    int copy_w = src_w < WIN_WIDTH  ? src_w : WIN_WIDTH;
-    int copy_h = src_h < WIN_HEIGHT ? src_h : WIN_HEIGHT;
-    int dst_x = win->BorderLeft;
-    int dst_y = win->BorderTop;
+    /* Initial render + title. */
+    render_current_page(&st);
+    update_title(&st, filename);
+    redraw(&st);
 
-    WritePixelArray(pix->samples,
-                    0, 0,                 /* src x, y */
-                    pix->stride,          /* src bytes per row */
-                    PIXF_R8G8B8,          /* src pixel format */
-                    win->RPort,           /* destination RastPort */
-                    dst_x, dst_y,
-                    copy_w, copy_h);
-
-    /* --- Event loop: wait for close or any key --- */
+    /* Event loop. */
     BOOL running = TRUE;
     while (running) {
-        WaitPort(win->UserPort);
+        WaitPort(st.win->UserPort);
         struct IntuiMessage *msg;
-        while ((msg = (struct IntuiMessage*)GetMsg(win->UserPort))) {
+        while ((msg = (struct IntuiMessage*)GetMsg(st.win->UserPort))) {
             ULONG class = msg->Class;
+            UWORD code  = msg->Code;
+            BOOL is_key_press = !(code & IECODE_UP_PREFIX);
+            UWORD keycode = code & ~IECODE_UP_PREFIX;
             ReplyMsg((struct Message*)msg);
-            if (class == IDCMP_CLOSEWINDOW || class == IDCMP_RAWKEY)
+
+            if (class == IDCMP_CLOSEWINDOW) {
                 running = FALSE;
+                break;
+            }
+            if (class == IDCMP_NEWSIZE) {
+                render_current_page(&st);
+                redraw(&st);
+                continue;
+            }
+            if (class == IDCMP_REFRESHWINDOW) {
+                BeginRefresh(st.win);
+                redraw(&st);
+                EndRefresh(st.win, TRUE);
+                continue;
+            }
+            if (class == IDCMP_RAWKEY && is_key_press) {
+                int new_page = st.current_page;
+                switch (keycode) {
+                case RAWKEY_ESCAPE:
+                    running = FALSE;
+                    break;
+                case RAWKEY_PAGEDOWN:
+                case RAWKEY_SPACE:
+                case RAWKEY_RIGHT:
+                case RAWKEY_DOWN:
+                    if (new_page < st.page_count - 1) new_page++;
+                    break;
+                case RAWKEY_PAGEUP:
+                case RAWKEY_BACKSPACE:
+                case RAWKEY_LEFT:
+                case RAWKEY_UP:
+                    if (new_page > 0) new_page--;
+                    break;
+                case RAWKEY_HOME:
+                    new_page = 0;
+                    break;
+                case RAWKEY_END:
+                    new_page = st.page_count - 1;
+                    break;
+                default:
+                    break;
+                }
+                if (new_page != st.current_page) {
+                    st.current_page = new_page;
+                    render_current_page(&st);
+                    update_title(&st, filename);
+                    redraw(&st);
+                }
+            }
         }
     }
 
-    /* --- Cleanup --- */
-    CloseWindow(win);
+    CloseWindow(st.win);
     UnlockPubScreen(NULL, screen);
-    fz_drop_pixmap(ctx, pix);
-    fz_drop_page(ctx, page);
-    fz_drop_document(ctx, doc);
-    fz_drop_context(ctx);
+    if (st.pix) fz_drop_pixmap(st.ctx, st.pix);
+    fz_drop_document(st.ctx, st.doc);
+    fz_drop_context(st.ctx);
     return 0;
 }
