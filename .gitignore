@@ -1,0 +1,12 @@
+build/
+build-*/
+*.o
+*.a
+*.exe
+*.lha
+mupdf/
+mupdf-*.tar.*
+.idea/
+.vscode/
+__pycache__/
+*.pyc
