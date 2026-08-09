@@ -127,6 +127,26 @@ static void die(const char *msg) {
     exit(1);
 }
 
+/* Return TRUE if a document is loaded. Otherwise show a requester
+ * telling the user to Open one first, and return FALSE. Used by
+ * every menu action that requires a doc — previously they silently
+ * no-oped, which made the whole menu look broken when TrapezePDF
+ * was launched without argv (or when a URL fetch failed). */
+static BOOL require_doc(viewer_state *st, const char *what)
+{
+    if (st->doc) return TRUE;
+    static char msg[256];
+    snprintf(msg, sizeof(msg),
+        "%s needs an open document.\n\n"
+        "Use File > Open... first, or launch TrapezePDF\n"
+        "with a file path or https:// URL on the command line.",
+        what ? what : "This action");
+    struct EasyStruct es = { sizeof(struct EasyStruct), 0,
+        "TrapezePDF", msg, "OK" };
+    EasyRequest(st->win, &es, NULL);
+    return FALSE;
+}
+
 /* --- Menu construction ------------------------------------------------
  * NewMenu-array approach: simplest way to build a full menu strip on OS4.
  * Uses NM_TITLE for menu, NM_ITEM for entries, NM_END to close. */
@@ -261,6 +281,11 @@ static const char *basename_of(const char *path)
 static void update_title(viewer_state *st)
 {
     static char title[256];
+    if (!st->doc || st->page_count == 0) {
+        SetWindowTitles(st->win, (STRPTR)"TrapezePDF - no document open",
+                        (STRPTR)-1);
+        return;
+    }
     const char *base = basename_of(st->filepath);
     const char *zoom_str = "Fit";
     char zoom_buf[16];
@@ -372,6 +397,18 @@ static void open_document(viewer_state *st, const char *path)
         strcpy(cached_path, "T:trapeze_download.pdf");
         if (fetch_url(path, cached_path) != 0) {
             fprintf(stderr, "TrapezePDF: URL fetch failed for %s\n", path);
+            static char msg[512];
+            snprintf(msg, sizeof(msg),
+                "URL fetch failed: %.256s\n\n"
+                "Check T:trapeze_fetch.log for details.\n"
+                "Common causes:\n"
+                "  - No default route on the guest\n"
+                "  - openssl not at DH1:openssl\n"
+                "  - AmiSSL certs missing at DH1:AmiSSL/Certs",
+                path);
+            struct EasyStruct es = { sizeof(struct EasyStruct), 0,
+                "TrapezePDF", msg, "OK" };
+            EasyRequest(st->win, &es, NULL);
             return;
         }
         actual_path = cached_path;
@@ -385,6 +422,14 @@ static void open_document(viewer_state *st, const char *path)
     fz_catch(st->ctx) {
         fprintf(stderr, "TrapezePDF: cannot open %s: %s\n",
                 actual_path, fz_caught_message(st->ctx));
+        static char msg[512];
+        snprintf(msg, sizeof(msg),
+            "Cannot open %.256s:\n\n%.200s\n\n"
+            "Check the path exists and is a readable PDF.",
+            actual_path, fz_caught_message(st->ctx));
+        struct EasyStruct es = { sizeof(struct EasyStruct), 0,
+            "TrapezePDF", msg, "OK" };
+        EasyRequest(st->win, &es, NULL);
         return;
     }
     if (st->doc) fz_drop_document(st->ctx, st->doc);
@@ -499,7 +544,7 @@ static int write_ps_to(viewer_state *st, const char *out_path)
  * intermediate; deletes it after copying. */
 static void action_file_print(viewer_state *st)
 {
-    if (!st->doc) return;
+    if (!require_doc(st, "Print")) return;
     fprintf(stderr, "pdfview: print — rendering %d pages via mupdf...\n",
             st->page_count);
     const char *ps_path = "T:pdfview_print.ps";
@@ -515,7 +560,7 @@ static void action_file_print(viewer_state *st)
  * an OS4 printer driver installed. */
 static void action_file_print_to_file(viewer_state *st)
 {
-    if (!st->doc) return;
+    if (!require_doc(st, "Print to File")) return;
     char default_name[256];
     const char *base = basename_of(st->filepath);
     /* Swap trailing .pdf for .ps if we can. */
@@ -577,7 +622,7 @@ static char *ask_save_path(viewer_state *st, const char *title,
 
 static void action_file_saveas(viewer_state *st)
 {
-    if (!st->doc) return;
+    if (!require_doc(st, "Save As")) return;
     pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
     if (!pdf) {
         fprintf(stderr, "pdfview: save-as: not a PDF document\n");
@@ -601,9 +646,16 @@ static void action_file_saveas(viewer_state *st)
 /* Rotate current page by `deg` degrees (must be multiple of 90). */
 static void action_page_rotate(viewer_state *st, int deg)
 {
-    if (!st->doc) return;
+    if (!require_doc(st, "Rotate Page")) return;
     pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
-    if (!pdf) return;
+    if (!pdf) {
+        struct EasyStruct es = { sizeof(struct EasyStruct), 0,
+            "TrapezePDF",
+            "Rotate only works on PDF documents (this file is a different format).",
+            "OK" };
+        EasyRequest(st->win, &es, NULL);
+        return;
+    }
     fz_try(st->ctx) {
         pdf_obj *page_obj = pdf_lookup_page_obj(st->ctx, pdf,
                                                   st->current_page);
@@ -625,8 +677,8 @@ static void action_page_rotate(viewer_state *st, int deg)
 
 static void action_page_delete(viewer_state *st)
 {
-    if (!st->doc || st->page_count < 2) {
-        /* Refuse to delete the only page in a document. */
+    if (!require_doc(st, "Delete Page")) return;
+    if (st->page_count < 2) {
         struct EasyStruct es = { sizeof(struct EasyStruct), 0,
             "Delete Page",
             "Cannot delete: a PDF must have at least one page.",
@@ -660,7 +712,7 @@ static void action_page_delete(viewer_state *st)
  * a re-render). Good enough for the common "extract this receipt". */
 static void action_page_extract(viewer_state *st)
 {
-    if (!st->doc) return;
+    if (!require_doc(st, "Extract Page")) return;
     char default_name[128];
     snprintf(default_name, sizeof(default_name), "%s-page%d.pdf",
              basename_of(st->filepath), st->current_page + 1);
@@ -711,7 +763,7 @@ static char *ask_string(viewer_state *st, const char *title,
 
 static void action_annot_add_note(viewer_state *st)
 {
-    if (!st->doc) return;
+    if (!require_doc(st, "Add Sticky Note")) return;
     pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
     if (!pdf) return;
     char *text = ask_string(st, "Add Sticky Note",
@@ -746,7 +798,7 @@ static void action_annot_add_note(viewer_state *st)
 
 static void action_annot_delete_all(viewer_state *st)
 {
-    if (!st->doc) return;
+    if (!require_doc(st, "Delete Annotations")) return;
     pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
     if (!pdf) return;
     fz_try(st->ctx) {
@@ -776,7 +828,7 @@ static void action_annot_delete_all(viewer_state *st)
 
 static void action_form_list(viewer_state *st)
 {
-    if (!st->doc) return;
+    if (!require_doc(st, "List Form Fields")) return;
     pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
     if (!pdf) return;
 
@@ -826,7 +878,7 @@ static void action_form_list(viewer_state *st)
 
 static void action_form_fill_next(viewer_state *st)
 {
-    if (!st->doc) return;
+    if (!require_doc(st, "Fill Next Field")) return;
     pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
     if (!pdf) return;
     char *value = ask_string(st, "Fill Form Field",
