@@ -745,20 +745,144 @@ static void action_page_extract(viewer_state *st)
  * screen-to-page coord translation, undo stack. What we ship here:
  * add-a-sticky-note-at-page-center, and delete-all-annotations-on-page. */
 
-/* Ask the user for a string via a simple ASL string requester. Returns
- * malloc'd string or NULL. On OS4 without a proper string requester
- * class, we fake it via EasyRequest with a placeholder — real impl
- * would use ReAction string.gadget in a modal window. */
+/* Ask the user for a line of text via a small modal dialog built
+ * with gadtools: title bar, a prompt label, a STRING_KIND input with
+ * `default_val`, and OK / Cancel buttons. Returns malloc'd result or
+ * NULL if the user cancelled (Cancel, close gadget, ESC, or empty
+ * string on OK). RETURN inside the string gadget acts as OK.
+ *
+ * Modal: opens a small child window on TrapezePDF's screen, waits
+ * for the user to finish, then closes. The main window keeps its
+ * event queue intact — we just don't service it during the modal. */
+enum { STRDLG_TXT_ID = 1, STRDLG_OK_ID = 2, STRDLG_CANCEL_ID = 3 };
 static char *ask_string(viewer_state *st, const char *title,
                         const char *prompt, const char *default_val)
 {
-    /* Placeholder: since we don't yet have a proper string dialog,
-     * hardcode a demo note. TODO: replace with ReAction dialog. */
-    (void)st; (void)title; (void)prompt; (void)default_val;
-    static char demo[128];
-    snprintf(demo, sizeof(demo), "%s (added %d)", prompt ? prompt : "Note",
-             (int)(uintptr_t)st);   /* pseudo-unique per invocation */
-    return strdup(demo);
+    struct Screen *scr = st->win ? st->win->WScreen : NULL;
+    APTR vi = NULL;
+    struct Gadget *glist = NULL, *strgad = NULL, *ctx = NULL;
+    struct Window *dlg = NULL;
+    char *result = NULL;
+    int font_h;
+
+    /* We need visual-info for our screen — required by gadtools. */
+    vi = GetVisualInfo(scr, TAG_END);
+    if (!vi) return NULL;
+
+    /* Layout dims: fixed width, height derived from the screen font. */
+    font_h = scr ? (scr->RastPort.TxHeight + 4) : 12;
+    int W = 460, H = font_h * 6 + 24;
+    int prompt_x = 8, prompt_y = font_h * 1 + 4;
+    int str_y = prompt_y + font_h + 2;
+    int btn_y = str_y + font_h + 12;
+    int btn_w = 96, btn_h = font_h + 6;
+    int ok_x = W - 2 * btn_w - 24;
+    int cancel_x = W - btn_w - 12;
+
+    struct NewGadget ng;
+    ctx = CreateContext(&glist);
+    if (!ctx) { FreeVisualInfo(vi); return NULL; }
+
+    memset(&ng, 0, sizeof(ng));
+    ng.ng_TextAttr   = scr ? scr->Font : NULL;
+    ng.ng_VisualInfo = vi;
+
+    /* STRING_KIND — the actual text-entry gadget */
+    ng.ng_LeftEdge = prompt_x;
+    ng.ng_TopEdge  = str_y;
+    ng.ng_Width    = W - 2 * prompt_x;
+    ng.ng_Height   = font_h + 4;
+    ng.ng_GadgetText = NULL;
+    ng.ng_GadgetID = STRDLG_TXT_ID;
+    ng.ng_Flags = 0;
+    strgad = CreateGadget(STRING_KIND, ctx,
+        &ng,
+        GTST_MaxChars, 255,
+        GTST_String,   (uintptr_t)(default_val ? default_val : ""),
+        TAG_END);
+    if (!strgad) { FreeGadgets(glist); FreeVisualInfo(vi); return NULL; }
+
+    /* OK button — chain onto the string gadget */
+    struct Gadget *last = strgad;
+    ng.ng_LeftEdge = ok_x;
+    ng.ng_TopEdge  = btn_y;
+    ng.ng_Width    = btn_w;
+    ng.ng_Height   = btn_h;
+    ng.ng_GadgetText = (STRPTR)"OK";
+    ng.ng_GadgetID = STRDLG_OK_ID;
+    last = CreateGadget(BUTTON_KIND, last, &ng, TAG_END);
+
+    /* Cancel button — chain onto OK, not onto strgad */
+    ng.ng_LeftEdge = cancel_x;
+    ng.ng_GadgetText = (STRPTR)"Cancel";
+    ng.ng_GadgetID = STRDLG_CANCEL_ID;
+    CreateGadget(BUTTON_KIND, last, &ng, TAG_END);
+
+    /* Open modal-ish child window, centered on the parent's screen. */
+    int scr_w = scr ? scr->Width  : 640;
+    int scr_h = scr ? scr->Height : 480;
+    int dlg_left = (scr_w - W) / 2;
+    int dlg_top  = (scr_h - H) / 2;
+    dlg = OpenWindowTags(NULL,
+        WA_Title,       (uintptr_t)(title ? title : "Enter text"),
+        WA_Width,       W,
+        WA_Height,      H,
+        WA_Left,        dlg_left,
+        WA_Top,         dlg_top,
+        WA_Gadgets,     (uintptr_t)glist,
+        WA_Flags,       WFLG_DRAGBAR | WFLG_DEPTHGADGET |
+                        WFLG_CLOSEGADGET | WFLG_ACTIVATE |
+                        WFLG_SMART_REFRESH | WFLG_RMBTRAP,
+        WA_IDCMP,       IDCMP_GADGETUP | IDCMP_CLOSEWINDOW |
+                        IDCMP_VANILLAKEY | IDCMP_REFRESHWINDOW,
+        WA_PubScreen,   (uintptr_t)scr,
+        TAG_END);
+    if (!dlg) { FreeGadgets(glist); FreeVisualInfo(vi); return NULL; }
+    GT_RefreshWindow(dlg, NULL);
+
+    /* Render the prompt text above the string gadget. */
+    if (prompt && *prompt) {
+        SetAPen(dlg->RPort, 1);
+        Move(dlg->RPort, prompt_x, prompt_y + font_h - 2);
+        Text(dlg->RPort, (CONST_STRPTR)prompt, strlen(prompt));
+    }
+    ActivateGadget(strgad, dlg, NULL);
+
+    /* Modal event loop */
+    BOOL done = FALSE, accepted = FALSE;
+    while (!done) {
+        WaitPort(dlg->UserPort);
+        struct IntuiMessage *msg;
+        while ((msg = GT_GetIMsg(dlg->UserPort)) != NULL) {
+            ULONG cls = msg->Class;
+            UWORD code = msg->Code;
+            struct Gadget *g = (struct Gadget *)msg->IAddress;
+            GT_ReplyIMsg(msg);
+            if (cls == IDCMP_CLOSEWINDOW) { done = TRUE; }
+            else if (cls == IDCMP_VANILLAKEY && code == 27 /* ESC */) {
+                done = TRUE;
+            }
+            else if (cls == IDCMP_GADGETUP) {
+                if (g == strgad) { accepted = TRUE; done = TRUE; }
+                else if (g && g->GadgetID == STRDLG_OK_ID) {
+                    accepted = TRUE; done = TRUE;
+                }
+                else if (g && g->GadgetID == STRDLG_CANCEL_ID) { done = TRUE; }
+            }
+        }
+    }
+
+    if (accepted) {
+        STRPTR s = NULL;
+        GT_GetGadgetAttrs(strgad, dlg, NULL,
+                           GTST_String, (uintptr_t)&s, TAG_END);
+        if (s && *s) result = strdup((const char *)s);
+    }
+
+    CloseWindow(dlg);
+    FreeGadgets(glist);
+    FreeVisualInfo(vi);
+    return result;
 }
 
 static void action_annot_add_note(viewer_state *st)
@@ -767,7 +891,7 @@ static void action_annot_add_note(viewer_state *st)
     pdf_document *pdf = pdf_specifics(st->ctx, st->doc);
     if (!pdf) return;
     char *text = ask_string(st, "Add Sticky Note",
-                            "Note text (demo placeholder)", "");
+        "Note text (shown in a pop-up when the icon is clicked):", "");
     if (!text) return;
 
     fz_try(st->ctx) {

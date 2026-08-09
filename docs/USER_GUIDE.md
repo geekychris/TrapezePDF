@@ -87,10 +87,20 @@ Zoom + navigation duplicates of the keyboard shortcuts above.
 ### Annotate
 | Item | Shortcut | Behaviour |
 | ---- | -------- | --------- |
-| Add Sticky Note… | R-A + N | Add a `pdf_annot` note at (72, 72) on the current page |
+| Add Sticky Note… | R-A + N | Prompt for the note text in a small dialog, then place a sticky-note icon at the centre of the current page |
 | Delete All on Page | (none) | Remove every annotation on the current page |
 
 Annotations persist only after `File → Save As…`.
+
+**About sticky notes:** per the PDF spec, a sticky note is a
+fixed-size icon marker (typically 24×24 points). Long content lives
+in the annotation's `/Contents` field, and readers that support text
+annotations (Adobe Reader, Foxit, MuPDF's `mutool`) show that text
+in a pop-up when the icon is clicked. TrapezePDF places the icon at
+page centre; it is NOT a resizable text box. If you want an on-page
+text block, that's a "Free Text" annotation (`PDF_ANNOT_FREE_TEXT`)
+which requires interactive drag-select and isn't in this release
+(planned post-v1.0 alongside highlight-with-mouse and freehand).
 
 ### Form
 | Item | Shortcut | Behaviour |
