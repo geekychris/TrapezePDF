@@ -82,6 +82,7 @@ enum {
     MNU_FILE_OPEN = 1,
     MNU_FILE_SAVEAS,
     MNU_FILE_PRINT,
+    MNU_FILE_PRINT_FILE,
     MNU_FILE_QUIT,
     MNU_VIEW_FIRST,
     MNU_VIEW_LAST,
@@ -135,6 +136,7 @@ static struct NewMenu menu_data[] = {
     { NM_ITEM,  "Open URL from Clipboard", "U", 0, 0, (APTR)MNU_FILE_OPEN_URL },
     { NM_ITEM,  "Save As...",       "S", 0, 0, (APTR)MNU_FILE_SAVEAS       },
     { NM_ITEM,  "Print...",         "P", 0, 0, (APTR)MNU_FILE_PRINT        },
+    { NM_ITEM,  "Print to File...", 0,   0, 0, (APTR)MNU_FILE_PRINT_FILE   },
     { NM_ITEM,  NM_BARLABEL,        0,   0, 0, 0                          },
     { NM_ITEM,  "Quit",             "Q", 0, 0, (APTR)MNU_FILE_QUIT         },
 
@@ -457,26 +459,22 @@ static void action_file_open(viewer_state *st)
     FreeAslRequest(req);
 }
 
-/* File→Print — render each page to PGM (grayscale PBM) then send
- * via `type` to PRT: which routes through OS4 printer prefs. Simple
- * pipeline: no dialog for page range/copies in this pass, prints all
- * pages. Uses Ghostscript-independent path (renders through MuPDF,
- * writes bitmap directly to PRT:). */
-static void action_file_print(viewer_state *st)
-{
-    if (!st->doc) return;
-    fprintf(stderr, "pdfview: print — rendering %d pages via mupdf...\n",
-            st->page_count);
-    /* Write a PostScript envelope to T:pdfview_print.ps then send to PRT:
-     * via `copy T:pdfview_print.ps PRT:` — OS4 printer.device handles the
-     * driver. Delegate the actual PS generation to `mutool convert`
-     * fallback if available; otherwise render to PS via MuPDF's built-in
-     * `pdfwrite`-equivalent path. */
+/* ask_save_path is defined below with the other ASL helpers; forward-
+ * declare it here so Print (defined earlier) can use it. basename_of
+ * is already defined above. */
+static char *ask_save_path(viewer_state *st, const char *title,
+                            const char *default_name);
 
-    char ps_path[] = "T:pdfview_print.ps";
+/* Render the whole document as PostScript to `out_path`. Returns 0 on
+ * success, -1 on any MuPDF failure (message already emitted). Shared
+ * between "Print..." (writes to T: then copies to PRT:) and "Print to
+ * File..." (writes directly to the user-chosen path). */
+static int write_ps_to(viewer_state *st, const char *out_path)
+{
     fz_document_writer *wri = NULL;
+    int failed = 0;
     fz_try(st->ctx) {
-        wri = fz_new_document_writer(st->ctx, ps_path, "ps", NULL);
+        wri = fz_new_document_writer(st->ctx, out_path, "ps", NULL);
         for (int i = 0; i < st->page_count; i++) {
             fz_page *page = fz_load_page(st->ctx, st->doc, i);
             fz_rect r = fz_bound_page(st->ctx, page);
@@ -489,14 +487,56 @@ static void action_file_print(viewer_state *st)
     }
     fz_always(st->ctx) { fz_drop_document_writer(st->ctx, wri); }
     fz_catch(st->ctx) {
-        fprintf(stderr, "pdfview: print — PS writer failed: %s\n",
+        fprintf(stderr, "pdfview: PS writer failed: %s\n",
                 fz_caught_message(st->ctx));
-        return;
+        failed = 1;
     }
-    /* Now shell out via os.system-equivalent — DOS `Execute` on OS4. */
+    return failed ? -1 : 0;
+}
+
+/* File→Print — render all pages to PostScript, then copy to PRT:
+ * (routed through OS4 printer prefs). Uses a temp file in T: as the
+ * intermediate; deletes it after copying. */
+static void action_file_print(viewer_state *st)
+{
+    if (!st->doc) return;
+    fprintf(stderr, "pdfview: print — rendering %d pages via mupdf...\n",
+            st->page_count);
+    const char *ps_path = "T:pdfview_print.ps";
+    if (write_ps_to(st, ps_path) != 0) return;
     system("copy T:pdfview_print.ps PRT: QUIET");
     system("delete T:pdfview_print.ps QUIET");
     fprintf(stderr, "pdfview: print — sent to PRT:\n");
+}
+
+/* File→Print to File — same PS generation, but ask the user for an
+ * output path and write directly (no copy to PRT:). Convenient for
+ * saving a PS proof, feeding into ghostscript, or debugging without
+ * an OS4 printer driver installed. */
+static void action_file_print_to_file(viewer_state *st)
+{
+    if (!st->doc) return;
+    char default_name[256];
+    const char *base = basename_of(st->filepath);
+    /* Swap trailing .pdf for .ps if we can. */
+    snprintf(default_name, sizeof(default_name), "%s", base ? base : "print.ps");
+    size_t n = strlen(default_name);
+    if (n >= 4 &&
+        (strcasecmp(default_name + n - 4, ".pdf") == 0)) {
+        strcpy(default_name + n - 4, ".ps");
+    } else {
+        size_t room = sizeof(default_name) - n - 1;
+        if (room >= 3) strcat(default_name, ".ps");
+    }
+    char *path = ask_save_path(st, "Print to File (PostScript)",
+                                default_name);
+    if (!path) return;
+    fprintf(stderr, "pdfview: print to file — rendering %d pages -> %s\n",
+            st->page_count, path);
+    if (write_ps_to(st, path) == 0) {
+        fprintf(stderr, "pdfview: print to file — wrote %s\n", path);
+    }
+    free(path);
 }
 
 /* --- Phase 8: page management --------------------------------------
@@ -840,6 +880,7 @@ static BOOL handle_menu(viewer_state *st, UWORD menu_num)
     case MNU_FILE_OPEN_URL: action_file_open_url(st); break;
     case MNU_FILE_SAVEAS:   action_file_saveas(st); break;
     case MNU_FILE_PRINT:    action_file_print(st); break;
+    case MNU_FILE_PRINT_FILE: action_file_print_to_file(st); break;
     case MNU_FILE_QUIT:     return FALSE;
 
     case MNU_PAGE_ROTATE_CW:  action_page_rotate(st, 90); break;

@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 
 #include "net.h"
@@ -91,24 +92,44 @@ int trapeze_parse_url(const char *url,
 /* Write a minimal HTTP/1.0 request to req_file. Doesn't handle POST /
  * cookies / auth / redirects — we're just doing a GET. */
 static int write_http_request(const char *req_file,
+                              const char *host, int port, const char *path);
+/* Non-static thunk so unit tests can call the static implementation
+ * without pulling in the whole net.c compilation. */
+int trapeze_write_http_request(const char *req_file,
+                                const char *host, int port,
+                                const char *path)
+{
+    return write_http_request(req_file, host, port, path);
+}
+static int write_http_request(const char *req_file,
                               const char *host, int port, const char *path)
 {
     FILE *f = fopen(req_file, "wb");
     if (!f) return -1;
+    fprintf(f, "GET %s HTTP/1.0\r\n", path);
+    if (port == 443 || port == 80) {
+        fprintf(f, "Host: %s\r\n", host);
+    } else {
+        fprintf(f, "Host: %s:%d\r\n", host, port);
+    }
     fprintf(f,
-        "GET %s HTTP/1.0\r\n"
-        "Host: %s%s%d\r\n"
         "User-Agent: TrapezePDF/1.0 (AmigaOS 4)\r\n"
         "Accept: application/pdf, */*\r\n"
         "Connection: close\r\n"
-        "\r\n",
-        path, host,
-        (port == 443 || port == 80) ? "" : ":",
-        (port == 443 || port == 80) ? 0 : port);
+        "\r\n");
     fclose(f);
     return 0;
 }
 
+static int extract_http_body(const char *raw_file,
+                             unsigned char **body_out, size_t *body_len_out);
+/* Non-static thunk for the unit tests. */
+int trapeze_extract_http_body(const char *raw_file,
+                               unsigned char **body_out,
+                               size_t *body_len_out)
+{
+    return extract_http_body(raw_file, body_out, body_len_out);
+}
 /* Strip an HTTP response prefix down to just the body. Returns 0 on
  * success (body_out/body_len_out filled with malloc'd data), non-zero
  * on failure. */
@@ -135,14 +156,40 @@ static int extract_http_body(const char *raw_file,
     unsigned char *http = (unsigned char *)memmem(buf, got, "HTTP/", 5);
     unsigned char *scan = http ? http : buf;
     size_t remain = got - (size_t)(scan - buf);
+    int sep_len = 4;
     unsigned char *sep = (unsigned char *)memmem(scan, remain, "\r\n\r\n", 4);
-    if (!sep) sep = (unsigned char *)memmem(scan, remain, "\n\n", 2);
+    if (!sep) {
+        sep = (unsigned char *)memmem(scan, remain, "\n\n", 2);
+        sep_len = 2;
+    }
     if (!sep) { free(buf); return -1; }
 
-    size_t hdr_len = (size_t)(sep - scan) +
-                     (sep[1] == '\n' ? 2 : 4);
+    size_t hdr_len = (size_t)(sep - scan) + sep_len;
     unsigned char *body = scan + hdr_len;
     size_t body_len = remain - hdr_len;
+
+    /* If Content-Length: is present in the response headers, trust it
+     * — openssl s_client's TLS session-info output can end up appended
+     * to our captured stdout on OS4, so an unbounded body would carry
+     * cert-chain text past the PDF's %%EOF. Case-insensitive scan
+     * limited to the header region. */
+    for (size_t i = 0; i + 15 < hdr_len; i++) {
+        if ((scan[i] == 'C' || scan[i] == 'c') &&
+            strncasecmp((const char *)(scan + i), "Content-Length:", 15) == 0)
+        {
+            size_t j = i + 15;
+            while (j < hdr_len && (scan[j] == ' ' || scan[j] == '\t')) j++;
+            long declared = 0;
+            while (j < hdr_len && scan[j] >= '0' && scan[j] <= '9') {
+                declared = declared * 10 + (scan[j] - '0');
+                j++;
+            }
+            if (declared > 0 && (size_t)declared < body_len) {
+                body_len = (size_t)declared;
+            }
+            break;
+        }
+    }
 
     /* Move body to the start of buf so caller can free the one pointer. */
     memmove(buf, body, body_len);
@@ -152,26 +199,47 @@ static int extract_http_body(const char *raw_file,
     return 0;
 }
 
+/* Diagnostic log — written to a fixed path so it survives whatever
+ * stdout/stderr redirection the shell did (or didn't do). Any URL
+ * fetch failure diagnosis starts here. */
+#define TRAPEZE_LOG_PATH  "T:trapeze_fetch.log"
+static FILE *g_log = NULL;
+static void log_open(void)  { g_log = fopen(TRAPEZE_LOG_PATH, "w"); }
+static void log_close(void) { if (g_log) { fclose(g_log); g_log = NULL; } }
+#define LOG(...) do {                                              \
+    fprintf(stderr, __VA_ARGS__);                                  \
+    if (g_log) { fprintf(g_log, __VA_ARGS__); fflush(g_log); }     \
+} while (0)
+
 /* Fetch a URL, save to `out_path`. Returns 0 on success. */
 int fetch_url(const char *url, const char *out_path)
 {
+    log_open();
+    LOG("TrapezePDF: fetch_url(%s -> %s)\n", url, out_path);
+
     char scheme[16], host[256], path[1024];
     int port;
     if (trapeze_parse_url(url, scheme, sizeof(scheme), host, sizeof(host),
                            &port, path, sizeof(path)) != 0) {
-        fprintf(stderr, "TrapezePDF: URL parse failed: %s\n", url);
+        LOG("TrapezePDF: URL parse failed: %s\n", url);
+        log_close();
         return -1;
     }
+    LOG("TrapezePDF: parsed scheme=%s host=%s port=%d path=%s\n",
+        scheme, host, port, path);
     if (strcmp(scheme, "http") != 0 && strcmp(scheme, "https") != 0) {
-        fprintf(stderr, "TrapezePDF: only http/https URLs supported\n");
+        LOG("TrapezePDF: only http/https URLs supported\n");
+        log_close();
         return -1;
     }
 
     const char *req_file = "T:trapeze_req";
     const char *raw_file = "T:trapeze_raw";
+    /* Wipe any leftover file so we can tell if openssl wrote a fresh one. */
+    remove(raw_file);
     if (write_http_request(req_file, host, port, path) != 0) {
-        fprintf(stderr, "TrapezePDF: cannot write request file %s\n",
-                req_file);
+        LOG("TrapezePDF: cannot write request file %s\n", req_file);
+        log_close();
         return -1;
     }
 
@@ -186,28 +254,35 @@ int fetch_url(const char *url, const char *out_path)
             "-quiet -CApath DH1:AmiSSL/Certs >%s",
             req_file, ossl, host, port, host, raw_file);
     } else {
-        /* Plain HTTP — no openssl; use the `type` + tcp:host/port DOS
-         * device? OS4 doesn't have one directly. Fall back to openssl
-         * s_client which will happily do plain-text if you pass no
-         * -connect over TLS, but for http we'd need a real client.
-         * For simplicity in this pass, refuse http:// and require
-         * https:// URLs. */
-        fprintf(stderr, "TrapezePDF: plain http:// not supported yet, "
-                        "use https:// or upgrade the URL manually\n");
+        LOG("TrapezePDF: plain http:// not supported yet\n");
+        log_close();
         return -1;
     }
 
-    fprintf(stderr, "TrapezePDF: fetching %s...\n", url);
+    LOG("TrapezePDF: cmd=%s\n", cmd);
     int rc = system(cmd);
-    (void)rc;   /* openssl exits non-zero even on success for some cases */
+    LOG("TrapezePDF: system() rc=%d\n", rc);
+
+    /* Report raw_file size before parsing. */
+    FILE *rf = fopen(raw_file, "rb");
+    if (!rf) {
+        LOG("TrapezePDF: %s does not exist after system() — openssl not "
+            "found or ran with no output\n", raw_file);
+    } else {
+        fseek(rf, 0, SEEK_END);
+        long sz = ftell(rf);
+        fclose(rf);
+        LOG("TrapezePDF: %s size = %ld bytes\n", raw_file, sz);
+    }
 
     unsigned char *body = NULL;
     size_t body_len = 0;
     if (extract_http_body(raw_file, &body, &body_len) != 0) {
-        fprintf(stderr, "TrapezePDF: no HTTP response body extracted "
-                "(is openssl at %s working?)\n", ossl);
+        LOG("TrapezePDF: no HTTP response body extracted "
+            "(openssl at %s produced no valid output)\n", ossl);
         remove(req_file);
         remove(raw_file);
+        log_close();
         return -1;
     }
     remove(req_file);
@@ -215,16 +290,17 @@ int fetch_url(const char *url, const char *out_path)
 
     FILE *out = fopen(out_path, "wb");
     if (!out) {
-        fprintf(stderr, "TrapezePDF: cannot write %s\n", out_path);
+        LOG("TrapezePDF: cannot write %s\n", out_path);
         free(body);
+        log_close();
         return -1;
     }
     fwrite(body, 1, body_len, out);
     fclose(out);
     free(body);
 
-    fprintf(stderr, "TrapezePDF: downloaded %zu bytes to %s\n",
-            body_len, out_path);
+    LOG("TrapezePDF: downloaded %zu bytes to %s\n", body_len, out_path);
+    log_close();
     return 0;
 }
 

@@ -10,3 +10,4 @@ mupdf-*.tar.*
 .vscode/
 __pycache__/
 *.pyc
+probes/
