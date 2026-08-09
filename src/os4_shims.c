@@ -9,6 +9,34 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* --- Suppress "Please insert volume ..." requesters -----------------
+ *
+ * On AmigaOS 4 newlib, when the C runtime or DOS layer encounters an
+ * argv or path that looks like a volume-prefixed name (e.g.
+ * "https://foo/bar" gets parsed as volume "https:" + path
+ * "//foo/bar"), it pops an intuition requester asking the user to
+ * insert volume "https:". Blocks our process until dismissed and
+ * makes TrapezePDF unusable with URL arguments.
+ *
+ * Setting pr_WindowPtr = -1 on our process tells DOS to fail these
+ * lookups silently instead of asking. Same trick Bill's amiga_shim.c
+ * in python-amigaos4 uses. Constructor runs before main(). */
+#ifdef __amigaos4__
+#include <proto/exec.h>
+#include <dos/dos.h>
+#include <dos/dosextens.h>    /* struct Process */
+__attribute__((constructor))
+static void suppress_dos_requesters(void)
+{
+    if (IExec) {
+        struct Process *proc = (struct Process *)FindTask(NULL);
+        if (proc && proc->pr_Task.tc_Node.ln_Type == NT_PROCESS) {
+            proc->pr_WindowPtr = (APTR)-1;
+        }
+    }
+}
+#endif
+
 /* --- memmem ---------------------------------------------------------
  * GNU extension; newlib doesn't ship it. Naïve O(nh*ne) fine for our
  * needle sizes (small — HTTP headers scanning). */
