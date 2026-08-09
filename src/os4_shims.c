@@ -7,6 +7,25 @@
  */
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
+
+/* --- memmem ---------------------------------------------------------
+ * GNU extension; newlib doesn't ship it. Naïve O(nh*ne) fine for our
+ * needle sizes (small — HTTP headers scanning). */
+void *memmem(const void *haystack, size_t haystack_len,
+              const void *needle, size_t needle_len)
+{
+    if (needle_len == 0) return (void *)haystack;
+    if (haystack_len < needle_len) return NULL;
+    const unsigned char *h = (const unsigned char *)haystack;
+    const unsigned char *n = (const unsigned char *)needle;
+    size_t limit = haystack_len - needle_len;
+    for (size_t i = 0; i <= limit; i++) {
+        if (memcmp(h + i, n, needle_len) == 0)
+            return (void *)(h + i);
+    }
+    return NULL;
+}
 
 /* --- timegm ---------------------------------------------------------
  * BSD extension; converts a `struct tm` interpreted as UTC into a

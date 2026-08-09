@@ -47,6 +47,8 @@
 #include <mupdf/pdf.h>       /* pdf_document, pdf_page, pdf_annot,
                               * pdf_widget — needed for phases 6/7/8 */
 
+#include "net.h"             /* fetch_url() for File → Open URL */
+
 #define WIN_WIDTH   800
 #define WIN_HEIGHT  600
 #define MIN_WIDTH   400
@@ -102,6 +104,8 @@ enum {
     /* Phase 7: form fill */
     MNU_FORM_FILL_NEXT,
     MNU_FORM_LIST,
+    /* URL / clipboard */
+    MNU_FILE_OPEN_URL,
     MNU_HELP_ABOUT
 };
 
@@ -128,6 +132,7 @@ static void die(const char *msg) {
 static struct NewMenu menu_data[] = {
     { NM_TITLE, "File",             0,   0, 0, 0                          },
     { NM_ITEM,  "Open...",          "O", 0, 0, (APTR)MNU_FILE_OPEN         },
+    { NM_ITEM,  "Open URL from Clipboard", "U", 0, 0, (APTR)MNU_FILE_OPEN_URL },
     { NM_ITEM,  "Save As...",       "S", 0, 0, (APTR)MNU_FILE_SAVEAS       },
     { NM_ITEM,  "Print...",         "P", 0, 0, (APTR)MNU_FILE_PRINT        },
     { NM_ITEM,  NM_BARLABEL,        0,   0, 0, 0                          },
@@ -269,28 +274,159 @@ static void update_title(viewer_state *st)
     SetWindowTitles(st->win, (STRPTR)title, (STRPTR)-1);
 }
 
-/* Load a new document, replacing the current one. */
+/* Read clipboard.device unit 0 as text — returns malloc'd 0-terminated
+ * string or NULL if empty/unreadable. Skips the IFF FTXT wrapper. */
+#include <devices/clipboard.h>
+#include <exec/io.h>
+#include <exec/memory.h>
+static char *read_clipboard_text(void)
+{
+    struct MsgPort *port = CreateMsgPort();
+    if (!port) return NULL;
+    struct IOClipReq *req = (struct IOClipReq *)CreateIORequest(port,
+                                            sizeof(struct IOClipReq));
+    if (!req) { DeleteMsgPort(port); return NULL; }
+    req->io_ClipID = 0;
+    if (OpenDevice("clipboard.device", 0,
+                    (struct IORequest *)req, 0)) {
+        DeleteIORequest((struct IORequest *)req);
+        DeleteMsgPort(port);
+        return NULL;
+    }
+
+    /* Read entire clipboard into a growable buffer. clipboard.device
+     * gives us IFF-formatted data; we skip FORM/FTXT/CHRS headers and
+     * concat the CHRS payload. Simple parser sufficient for URL cases. */
+    char *out = NULL;
+    size_t out_len = 0;
+    unsigned char buf[512];
+
+    req->io_Command = CMD_READ;
+    req->io_Data    = (STRPTR)buf;
+    req->io_Length  = sizeof(buf);
+    req->io_Offset  = 0;
+    req->io_ClipID  = 0;
+
+    while (DoIO((struct IORequest *)req) == 0 && req->io_Actual > 0) {
+        char *nb = (char *)realloc(out, out_len + req->io_Actual);
+        if (!nb) break;
+        out = nb;
+        memcpy(out + out_len, buf, req->io_Actual);
+        out_len += req->io_Actual;
+        req->io_Command = CMD_READ;
+        req->io_Data    = (STRPTR)buf;
+        req->io_Length  = sizeof(buf);
+    }
+
+    CloseDevice((struct IORequest *)req);
+    DeleteIORequest((struct IORequest *)req);
+    DeleteMsgPort(port);
+
+    if (!out || out_len == 0) { free(out); return NULL; }
+
+    /* Very-loose IFF parse: skip until CHRS chunk, then copy its
+     * payload out. If no CHRS found, treat whole buffer as text. */
+    unsigned char *scan = (unsigned char *)out;
+    unsigned char *end = scan + out_len;
+    for (unsigned char *p = scan; p + 8 <= end; p++) {
+        if (p[0] == 'C' && p[1] == 'H' && p[2] == 'R' && p[3] == 'S') {
+            unsigned int len = ((unsigned int)p[4] << 24) |
+                                ((unsigned int)p[5] << 16) |
+                                ((unsigned int)p[6] << 8)  |
+                                ((unsigned int)p[7]);
+            if (p + 8 + len > end) break;
+            char *text = (char *)malloc(len + 1);
+            if (!text) { free(out); return NULL; }
+            memcpy(text, p + 8, len);
+            text[len] = '\0';
+            free(out);
+            /* Trim trailing whitespace/newlines/nulls */
+            while (len > 0 && (text[len-1] == '\n' || text[len-1] == '\r' ||
+                                text[len-1] == ' ' || text[len-1] == '\0'))
+                text[--len] = '\0';
+            return text;
+        }
+    }
+    /* No CHRS chunk — try to interpret entire clipboard as text.
+     * Null-terminate and trim. */
+    char *text = (char *)realloc(out, out_len + 1);
+    if (!text) text = out;
+    text[out_len] = '\0';
+    while (out_len > 0 && (text[out_len-1] == '\n' || text[out_len-1] == '\r' ||
+                            text[out_len-1] == ' '))
+        text[--out_len] = '\0';
+    return text;
+}
+
+/* Load a new document, replacing the current one. Handles both local
+ * paths and http(s):// URLs (via fetch_url — see src/net.c). */
 static void open_document(viewer_state *st, const char *path)
 {
+    const char *actual_path = path;
+    char cached_path[64];
+    if (is_url(path)) {
+        /* Download to T: — the URL is transient state, no need to
+         * keep it around. Overwrites previous download. */
+        strcpy(cached_path, "T:trapeze_download.pdf");
+        if (fetch_url(path, cached_path) != 0) {
+            fprintf(stderr, "TrapezePDF: URL fetch failed for %s\n", path);
+            return;
+        }
+        actual_path = cached_path;
+    }
+
     fz_document *newdoc = NULL;
     fz_try(st->ctx) {
-        newdoc = fz_open_document(st->ctx, path);
+        newdoc = fz_open_document(st->ctx, actual_path);
         if (!newdoc) fz_throw(st->ctx, FZ_ERROR_GENERIC, "open_document NULL");
     }
     fz_catch(st->ctx) {
-        fprintf(stderr, "pdfview: cannot open %s: %s\n",
-                path, fz_caught_message(st->ctx));
+        fprintf(stderr, "TrapezePDF: cannot open %s: %s\n",
+                actual_path, fz_caught_message(st->ctx));
         return;
     }
     if (st->doc) fz_drop_document(st->ctx, st->doc);
     st->doc = newdoc;
     st->page_count = fz_count_pages(st->ctx, newdoc);
     st->current_page = 0;
+    /* Store the ORIGINAL path (URL or local) in filepath — that's
+     * what the user sees in the title bar. actual_path may point
+     * to the T: cache file for URL downloads. */
     strncpy(st->filepath, path, sizeof(st->filepath) - 1);
     st->filepath[sizeof(st->filepath) - 1] = '\0';
     render_current_page(st);
     update_title(st);
     redraw(st);
+}
+
+/* File → Open URL from Clipboard. Reads clipboard.device, expects
+ * a http(s):// URL, downloads and opens. */
+static void action_file_open_url(viewer_state *st)
+{
+    char *url = read_clipboard_text();
+    if (!url || !*url) {
+        struct EasyStruct es = { sizeof(struct EasyStruct), 0,
+            "Open URL from Clipboard",
+            "Clipboard is empty or unreadable.\n\n"
+            "Copy an http:// or https:// URL to the clipboard first,\n"
+            "then try again.",
+            "OK" };
+        EasyRequest(st->win, &es, NULL);
+        free(url);
+        return;
+    }
+    if (!is_url(url)) {
+        struct EasyStruct es = { sizeof(struct EasyStruct), 0,
+            "Open URL from Clipboard",
+            "Clipboard contents do not look like a URL.\n\n"
+            "Expected http:// or https:// prefix.",
+            "OK" };
+        EasyRequest(st->win, &es, NULL);
+        free(url);
+        return;
+    }
+    open_document(st, url);
+    free(url);
 }
 
 /* File→Open — ASL requester (asl.library). */
@@ -700,10 +836,11 @@ static BOOL handle_menu(viewer_state *st, UWORD menu_num)
     ULONG id = (ULONG)(uintptr_t)GTMENUITEM_USERDATA(item);
 
     switch (id) {
-    case MNU_FILE_OPEN:   action_file_open(st); break;
-    case MNU_FILE_SAVEAS: action_file_saveas(st); break;
-    case MNU_FILE_PRINT:  action_file_print(st); break;
-    case MNU_FILE_QUIT:   return FALSE;
+    case MNU_FILE_OPEN:     action_file_open(st); break;
+    case MNU_FILE_OPEN_URL: action_file_open_url(st); break;
+    case MNU_FILE_SAVEAS:   action_file_saveas(st); break;
+    case MNU_FILE_PRINT:    action_file_print(st); break;
+    case MNU_FILE_QUIT:     return FALSE;
 
     case MNU_PAGE_ROTATE_CW:  action_page_rotate(st, 90); break;
     case MNU_PAGE_ROTATE_CCW: action_page_rotate(st, -90); break;
