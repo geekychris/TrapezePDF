@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="TrapezePDF logo" width="180">
+</p>
+
 # TrapezePDF
 
 A native PDF viewer for AmigaOS 4.1 PPC, built on MuPDF. By Chris
